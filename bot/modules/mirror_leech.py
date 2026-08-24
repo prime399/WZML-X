@@ -1,6 +1,9 @@
+from ast import literal_eval
 from base64 import b64encode
+from os import path as ospath
 from re import match as re_match
 
+from aiofiles import open as aiopen
 from aiofiles.os import path as aiopath
 from bot.core.config_manager import Config
 
@@ -23,6 +26,11 @@ from ..helper.ext_utils.links_utils import (
 )
 from ..helper.ext_utils.task_manager import pre_task_check
 from ..helper.listeners.task_listener import TaskListener
+from ..helper.mirror_leech_utils.download_utils.alldebrid_resolver import (
+    alldebrid_resolve,
+    alldebrid_resolve_magnet,
+    alldebrid_resolve_torrent,
+)
 from ..helper.mirror_leech_utils.download_utils.aria2_download import (
     add_aria2_download,
 )
@@ -85,6 +93,17 @@ class Mirror(TaskListener):
         self.is_uphoster = is_uphoster
 
     async def new_event(self):
+        if self.is_leech:
+            if Config.DISABLE_LEECH:
+                await send_message(
+                    self.message, "The Leech command is currently disabled."
+                )
+                return
+        elif Config.DISABLE_MIRROR and not self.is_uphoster:
+            await send_message(
+                self.message, "The Mirror command is currently disabled."
+            )
+            return
         text = self.message.text.split("\n")
         input_list = text[0].split(" ")
 
@@ -113,6 +132,7 @@ class Mirror(TaskListener):
             "-hl": False,
             "-bt": False,
             "-ut": False,
+            "-ad": False,
             "-yt": False,
             "-i": 0,
             "-sp": 0,
@@ -121,6 +141,7 @@ class Mirror(TaskListener):
             "-m": "",
             "-meta": "",
             "-up": "",
+            "-gc": "",
             "-rcf": "",
             "-au": "",
             "-ap": "",
@@ -161,6 +182,7 @@ class Mirror(TaskListener):
         self.seed = args["-d"]
         self.name = args["-n"]
         self.up_dest = args["-up"]
+        self.category = args["-gc"]
         self.rc_flags = args["-rcf"]
         self.link = args["link"]
         self.compress = args["-z"]
@@ -183,6 +205,7 @@ class Mirror(TaskListener):
         self.folder_name = f"/{args['-m']}".rstrip("/") if len(args["-m"]) > 0 else ""
         self.bot_trans = args["-bt"]
         self.user_trans = args["-ut"]
+        self.is_alldebrid = args["-ad"]
         self.is_yt = args["-yt"]
         self.metadata_dict = self.default_metadata_dict.copy()
         self.audio_metadata_dict = self.audio_metadata_dict.copy()
@@ -215,7 +238,10 @@ class Mirror(TaskListener):
                 if isinstance(args["-ff"], set):
                     self.ffmpeg_cmds = args["-ff"]
                 else:
-                    self.ffmpeg_cmds = eval(args["-ff"])
+                    value = literal_eval(args["-ff"])
+                    if not isinstance(value, (dict, set, list, tuple)):
+                        raise ValueError("ffmpeg_cmds must be a dict/set/list/tuple")
+                    self.ffmpeg_cmds = value
         except Exception as e:
             self.ffmpeg_cmds = None
             LOGGER.error(e)
@@ -375,8 +401,48 @@ class Mirror(TaskListener):
 
         self._set_mode_engine()
 
+        if self.is_alldebrid and (
+            is_magnet(self.link) or self.link.endswith(".torrent")
+        ):
+            try:
+                if is_magnet(self.link):
+                    LOGGER.info("AllDebrid magnet route")
+                    resolved = await alldebrid_resolve_magnet(
+                        self.link,
+                        is_cancelled=lambda: self.is_cancelled,
+                    )
+                else:
+                    LOGGER.info(f"AllDebrid torrent file route: {self.link}")
+                    async with aiopen(self.link, "rb") as fh:
+                        torrent_bytes = await fh.read()
+                    resolved = await alldebrid_resolve_torrent(
+                        torrent_bytes,
+                        ospath.basename(self.link),
+                        is_cancelled=lambda: self.is_cancelled,
+                    )
+            except DirectDownloadLinkException as e:
+                e = str(e)
+                LOGGER.info(e)
+                if e.startswith("ERROR:"):
+                    await send_message(self.message, e)
+                    await self.remove_from_same_dir()
+                    await delete_links(self.message)
+                    return
+                resolved = None
+            except Exception as e:
+                await send_message(self.message, e)
+                await self.remove_from_same_dir()
+                await delete_links(self.message)
+                return
+            if isinstance(resolved, dict):
+                self._alldebrid_magnet_id = resolved.get("magnet_id", 0)
+                self.link = resolved
+                self.is_jd = False
+                self.is_qbit = False
+
         if (
-            not self.is_jd
+            isinstance(self.link, str)
+            and not self.is_jd
             and not self.is_nzb
             and not self.is_qbit
             and not is_magnet(self.link)
@@ -387,8 +453,29 @@ class Mirror(TaskListener):
             and not is_gdrive_id(self.link)
             and not is_mega_link(self.link)
         ):
-            content_type = await get_content_type(self.link)
-            if content_type is None or re_match(r"text/html|text/plain", content_type):
+            if self.is_alldebrid:
+                try:
+                    self.link = await alldebrid_resolve(self.link)
+                    if isinstance(self.link, str):
+                        LOGGER.info(f"AllDebrid link: {self.link}")
+                except DirectDownloadLinkException as e:
+                    e = str(e)
+                    LOGGER.info(e)
+                    if e.startswith("ERROR:"):
+                        await send_message(self.message, e)
+                        await self.remove_from_same_dir()
+                        await delete_links(self.message)
+                        return
+                except Exception as e:
+                    await send_message(self.message, e)
+                    await self.remove_from_same_dir()
+                    await delete_links(self.message)
+                    return
+
+            if isinstance(self.link, str) and (
+                (content_type := await get_content_type(self.link)) is None
+                or re_match(r"text/html|text/plain", content_type)
+            ):
                 try:
                     self.link = await sync_to_async(direct_link_generator, self.link)
                     if isinstance(self.link, tuple):
@@ -409,8 +496,6 @@ class Mirror(TaskListener):
                     await self.remove_from_same_dir()
                     await delete_links(self.message)
                     return
-
-        await delete_links(self.message)
 
         if file_ is not None:
             await TelegramDownloadHelper(self).add_download(
@@ -450,17 +535,39 @@ async def qb_mirror(client, message):
 
 
 async def jd_mirror(client, message):
+    if Config.DISABLE_JD:
+        await message.reply("JDownloader is currently disabled by the Bot Owner.")
+        return
     bot_loop.create_task(Mirror(client, message, is_jd=True).new_event())
 
 
+def hydra_nzb_id(message, cmd, force_extract=True):
+    text_parts = message.text.split()
+    if len(text_parts) > 1 and not text_parts[1].startswith(("http", "ftp", "/")):
+        potential_id = text_parts[1]
+        clean = potential_id.lstrip("-").replace("_", "")
+        if clean.isalnum() and not (potential_id.startswith("-") and clean.isalpha()):
+            nzb_url = f"{Config.HYDRA_IP.rstrip('/')}/getnzb/api/{potential_id}?apikey={Config.HYDRA_API_KEY}"
+            extra = " ".join(text_parts[2:])
+            message.text = f"{cmd} {nzb_url} -e {extra}".strip()
+            return potential_id
+    elif force_extract and "-e" not in message.text:
+        message.text += " -e"
+    return None
+
+
 async def nzb_mirror(client, message):
-    bot_loop.create_task(Mirror(client, message, is_nzb=True).new_event())
+    if Config.DISABLE_NZB:
+        await message.reply("SABnzbd is currently disabled by the Bot Owner.")
+        return
+    nzb_id = hydra_nzb_id(message, "/nzbmirror")
+    mirror_task = Mirror(client, message, is_nzb=True)
+    if nzb_id:
+        mirror_task.nzb_id = nzb_id
+    bot_loop.create_task(mirror_task.new_event())
 
 
 async def leech(client, message):
-    if Config.DISABLE_LEECH:
-        await message.reply("The Leech command is currently disabled.")
-        return
     bot_loop.create_task(Mirror(client, message, is_leech=True).new_event())
 
 
@@ -471,10 +578,29 @@ async def qb_leech(client, message):
 
 
 async def jd_leech(client, message):
+    if Config.DISABLE_JD:
+        await message.reply("JDownloader is currently disabled by the Bot Owner.")
+        return
     bot_loop.create_task(Mirror(client, message, is_leech=True, is_jd=True).new_event())
 
 
 async def nzb_leech(client, message):
-    bot_loop.create_task(
-        Mirror(client, message, is_leech=True, is_nzb=True).new_event()
-    )
+    if Config.DISABLE_NZB:
+        await message.reply("SABnzbd is currently disabled by the Bot Owner.")
+        return
+    nzb_id = hydra_nzb_id(message, "/nzbleech")
+    mirror_task = Mirror(client, message, is_leech=True, is_nzb=True)
+    if nzb_id:
+        mirror_task.nzb_id = nzb_id
+    bot_loop.create_task(mirror_task.new_event())
+
+
+async def uphoster(client, message):
+    nzb_id = hydra_nzb_id(message, "/uphoster", force_extract=False)
+    if nzb_id and Config.DISABLE_NZB:
+        await message.reply("SABnzbd is currently disabled by the Bot Owner.")
+        return
+    mirror_task = Mirror(client, message, is_uphoster=True, is_nzb=bool(nzb_id))
+    if nzb_id:
+        mirror_task.nzb_id = nzb_id
+    bot_loop.create_task(mirror_task.new_event())

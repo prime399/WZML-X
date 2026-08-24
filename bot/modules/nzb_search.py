@@ -1,5 +1,7 @@
+from asyncio import TimeoutError as AsyncTimeout
 from xml.etree import ElementTree as ET
-from aiohttp import ClientSession
+
+from aiohttp import ClientSession, ClientTimeout
 
 from .. import LOGGER
 from ..core.config_manager import Config
@@ -12,6 +14,9 @@ from ..helper.telegram_helper.message_utils import edit_message, send_message
 
 @new_task
 async def hydra_search(_, message):
+    if Config.DISABLE_NZB:
+        await send_message(message, "SABnzbd is currently disabled by the Bot Owner.")
+        return
     key = message.text.split()
     if len(key) == 1:
         await send_message(
@@ -22,13 +27,18 @@ async def hydra_search(_, message):
 
     query = " ".join(key[1:]).strip()
     message = await send_message(message, f"Searching for '{query}'...")
-    try:
-        items = await search_nzbhydra(query)
-        if not items:
-            await edit_message(message, "No results found.")
-            LOGGER.info(f"No results found for search query: {query}")
-            return
 
+    items, error = await search_nzbhydra(query)
+    if error:
+        await edit_message(message, f"<b>Search failed:</b>\n<code>{error}</code>")
+        return
+
+    if not items:
+        await edit_message(message, "No results found.")
+        LOGGER.info(f"No results found for search query: {query}")
+        return
+
+    try:
         page_url = await create_telegraph_page(query, items)
         buttons = ButtonMaker()
         buttons.url_button("Results", page_url)
@@ -44,7 +54,7 @@ async def hydra_search(_, message):
 
 
 async def search_nzbhydra(query, limit=50):
-    search_url = f"{Config.HYDRA_IP}/api"
+    search_url = f"{Config.HYDRA_IP.rstrip('/')}/api"
     params = {
         "apikey": Config.HYDRA_API_KEY,
         "t": "search",
@@ -56,29 +66,40 @@ async def search_nzbhydra(query, limit=50):
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.3",
     }
 
-    async with ClientSession() as session:
+    async with ClientSession(timeout=ClientTimeout(total=15)) as session:
         try:
             async with session.get(
                 search_url,
                 params=params,
                 headers=headers,
             ) as response:
-                if response.status == 200:
-                    content = await response.text()
-                    root = ET.fromstring(content)
-                    return root.findall(".//item")
+                content = await response.text()
 
-                LOGGER.error(
-                    f"Failed to search NZBHydra. Status Code: {response.status}",
-                )
-                LOGGER.error(f"Response Text: {await response.text()}")
-                return None
+                if response.status != 200:
+                    LOGGER.error(
+                        f"NZBHydra returned status {response.status}: {content[:300]}"
+                    )
+                    return None, f"NZBHydra returned HTTP {response.status}"
+
+                root = ET.fromstring(content)
+
+                error = root.find("error")
+                if error is not None:
+                    desc = error.get("description", "Unknown error")
+                    LOGGER.error(f"NZBHydra error: {desc}")
+                    return None, desc
+
+                return root.findall(".//item"), None
+
         except ET.ParseError:
-            LOGGER.error("Failed to parse the XML response.")
-            return None
+            LOGGER.error("Failed to parse NZBHydra XML response.")
+            return None, "Invalid response from NZBHydra"
+        except AsyncTimeout:
+            LOGGER.error(f"NZBHydra connection timed out: {search_url}")
+            return None, "NZBHydra connection timed out"
         except Exception as e:
             LOGGER.error(f"Error in search_nzbhydra: {e!s}")
-            return None
+            return None, str(e)
 
 
 async def create_telegraph_page(query, items):
@@ -108,10 +129,19 @@ async def create_telegraph_page(query, items):
         )
         size = get_readable_file_size(size_bytes)
 
+        nzb_id = "Unknown"
+        if "getnzb/api/" in download_url:
+            try:
+                nzb_id = download_url.split("getnzb/api/")[1].split("?")[0]
+            except Exception:
+                pass
+
         content += (
             f"{idx}. {title}<br>"
-            f"<b><a href='{download_url}'>Download URL</a> | <a href='http://t.me/share/url?url={download_url}'>Share Download URL</a></b><br>"
+            f"<b>NZB ID:</b> <code>{nzb_id}</code><br>"
             f"<b>Size:</b> {size}<br>"
+            f"<b>Mirror:</b> <code>/nm {nzb_id}</code><br>"
+            f"<b>Leech:</b> <code>/nl {nzb_id}</code><br>"
             f"━━━━━━━━━━━━━━━━━━━━━━<br><br>"
         )
 

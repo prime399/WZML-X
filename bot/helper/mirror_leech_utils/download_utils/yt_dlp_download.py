@@ -5,7 +5,7 @@ from contextlib import suppress
 from secrets import token_hex
 from yt_dlp import YoutubeDL, DownloadError
 
-from .... import task_dict_lock, task_dict, user_data
+from .... import task_dict_lock, task_dict
 from ....core.config_manager import BinConfig
 from ...ext_utils.bot_utils import sync_to_async, async_to_sync
 from ...ext_utils.task_manager import (
@@ -18,6 +18,14 @@ from ...telegram_helper.message_utils import send_status_message
 from ..status_utils.yt_dlp_status import YtDlpStatus
 
 LOGGER = getLogger(__name__)
+
+
+def get_cookie_file(user_dict):
+    if not user_dict.get("USE_DEFAULT_COOKIE", False):
+        usr_cookie = user_dict.get("USER_COOKIE_FILE", "")
+        if usr_cookie and ospath.exists(usr_cookie):
+            return usr_cookie
+    return "cookies.txt"
 
 
 class MyLogger:
@@ -80,13 +88,7 @@ class YoutubeDLHelper:
                 "extractor": lambda n: 3,
             },
         }
-        cookie_to_use = (
-            usr_cookie
-            if not self._listener.user_dict.get("USE_DEFAULT_COOKIE", False)
-            and (usr_cookie := self._listener.user_dict.get("USER_COOKIE_FILE", ""))
-            and ospath.exists(usr_cookie)
-            else "cookies.txt"
-        )
+        cookie_to_use = get_cookie_file(self._listener.user_dict)
         self.opts["cookiefile"] = cookie_to_use
         LOGGER.info(
             f"Using cookies.txt file: {cookie_to_use} | User ID : {self._listener.user_id}"
@@ -142,7 +144,7 @@ class YoutubeDLHelper:
             task_dict[self._listener.mid] = YtDlpStatus(self._listener, self, self._gid)
         if not from_queue:
             await self._listener.on_download_start()
-            if self._listener.multi <= 1:
+            if self._listener.multi <= 1 and not self._listener.is_rss:
                 await send_status_message(self._listener.message)
 
     def _on_download_error(self, error):
@@ -150,8 +152,6 @@ class YoutubeDLHelper:
         async_to_sync(self._listener.on_download_error, error)
 
     def _extract_meta_data(self):
-        if self._listener.link.startswith(("rtmp", "mms", "rstp", "rtmps")):
-            self.opts["external_downloader"] = BinConfig.FFMPEG_NAME
         with YoutubeDL(self.opts) as ydl:
             try:
                 result = ydl.extract_info(self._listener.link, download=False)
@@ -165,7 +165,9 @@ class YoutubeDLHelper:
                 for entry in result["entries"]:
                     if not entry:
                         continue
-                    elif "filesize_approx" in entry:
+                    if entry.get("ext") == "unknown_video":
+                        entry["ext"] = "mp4"
+                    if "filesize_approx" in entry:
                         self._listener.size += entry.get("filesize_approx", 0) or 0
                     elif "filesize" in entry:
                         self._listener.size += entry.get("filesize", 0) or 0
@@ -177,6 +179,8 @@ class YoutubeDLHelper:
                         if not self._ext:
                             self._ext = ext
             else:
+                if result.get("ext") == "unknown_video":
+                    result["ext"] = "mp4"
                 outtmpl_ = "%(title,fulltitle,alt_title)s%(season_number& |)s%(season_number&S|)s%(season_number|)02d%(episode_number&E|)s%(episode_number|)02d%(height& |)s%(height|)s%(height&p|)s%(fps|)s%(fps&fps|)s%(tbr& |)s%(tbr|)d.%(ext)s"
                 realName = ydl.prepare_filename(result, outtmpl=outtmpl_)
                 ext = ospath.splitext(realName)[-1]
